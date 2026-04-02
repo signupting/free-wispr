@@ -1,5 +1,5 @@
 """
-Free Wispr - Tap fn to start/stop recording.
+Groq Whisper - Tap fn to start/stop recording.
 Menubar icon changes state. Uses Groq Whisper API with Hugging Face fallback.
 """
 
@@ -18,11 +18,14 @@ from scipy.io.wavfile import write as wav_write
 import objc
 from AppKit import NSSound
 from AppKit import (
-    NSApplication, NSColor,
-    NSMakeRect, NSBezierPath,
+    NSApplication, NSWindow, NSView, NSColor, NSFont,
+    NSMakeRect, NSScreen, NSBezierPath,
+    NSWindowStyleMaskBorderless, NSBackingStoreBuffered,
+    NSFloatingWindowLevel,
     NSApplicationActivationPolicyAccessory,
     NSStatusBar, NSVariableStatusItemLength, NSMenu, NSMenuItem,
     NSEvent, NSFlagsChangedMask, NSFunctionKeyMask,
+    NSKeyDownMask, NSKeyUpMask,
     NSImage, NSSize, NSTimer, NSRunLoop,
 )
 
@@ -36,6 +39,7 @@ groq_client = None
 recording = False
 processing = False
 audio_frames = []
+stream = None
 status_item = None
 state_lock = threading.Lock()
 
@@ -103,7 +107,7 @@ def create_menubar():
     menu.addItem_(toggle_item)
     menu.addItem_(NSMenuItem.separatorItem())
     quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Quit Free Wispr", "terminate:", "q"
+        "Quit Groq Whisper", "terminate:", "q"
     )
     menu.addItem_(quit_item)
     status_item.setMenu_(menu)
@@ -118,7 +122,7 @@ def update_menubar_icon(state="idle"):
 def notify(message):
     subprocess.run([
         "osascript", "-e",
-        f'display notification "{message}" with title "Free Wispr"'
+        f'display notification "{message}" with title "Groq Whisper"'
     ], capture_output=True)
 
 
@@ -160,11 +164,12 @@ def clean_prompt(raw_text):
                 {
                     "role": "system",
                     "content": (
-                        "You are a speech-to-prompt assistant. The user dictated a message "
-                        "via voice. Clean it up into a clear, well-structured prompt or message. "
-                        "Fix filler words, repetition, and unclear phrasing. Keep the original "
-                        "intent and meaning. Do NOT add anything the user didn't say. "
-                        "Do NOT wrap in quotes. Output ONLY the cleaned text, nothing else."
+                        "You are a transcription cleanup assistant. The user dictated text via voice. "
+                        "Make only the minimum edits needed: remove obvious filler words (um, uh, like), "
+                        "fix clear repetitions, and add punctuation. "
+                        "Preserve the user's exact words, tone, and phrasing as much as possible. "
+                        "Do NOT rephrase, rewrite, or restructure sentences. Do NOT wrap in quotes. "
+                        "Output ONLY the lightly cleaned text, nothing else."
                     ),
                 },
                 {"role": "user", "content": raw_text},
@@ -260,8 +265,9 @@ def do_stop_and_process():
             _log("No frames")
             return
 
+        _log(f"Concatenating {len(frames)} frames...")
         audio = np.concatenate(frames, axis=0)
-        del frames
+        del frames  # free memory early
         rms = np.sqrt(np.mean(audio ** 2))
         duration = len(audio) / SAMPLE_RATE
         _log(f"Stopped. RMS={rms:.6f} Duration={duration:.1f}s")
@@ -270,13 +276,14 @@ def do_stop_and_process():
             return
 
         update_menubar_icon("processing")
+        _log("Converting audio...")
         audio_int16 = (audio * 32767).astype(np.int16)
-        del audio
+        del audio  # free memory early
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             wav_write(f, SAMPLE_RATE, audio_int16)
             tmp_path = f.name
-        del audio_int16
+        del audio_int16  # free memory early
 
         # Save backup before API call
         backup_dir = os.path.expanduser("~/.local/groq-whisper-app/backups")
@@ -285,21 +292,24 @@ def do_stop_and_process():
         try:
             import shutil
             shutil.copy2(tmp_path, backup_path)
+            _log(f"Backup saved: {backup_path}")
         except Exception as e:
             _log(f"Backup failed: {e}")
 
         try:
+            _log("Sending to Groq...")
             try:
                 text = transcribe_groq(tmp_path)
-                _log(f"Transcribed: '{text}'")
+                _log(f"Groq: '{text}'")
             except Exception as e:
                 _log(f"Groq failed: {e}")
                 notify("Groq down, using HF fallback")
                 text = transcribe_huggingface(tmp_path)
-                _log(f"HF fallback: '{text}'")
+                _log(f"HF: '{text}'")
 
             if text:
                 text = clean_prompt(text)
+                _log(f"Cleaned: '{text}'")
                 paste_text(text)
                 play_sound("Ping")
                 # Remove backup on success
@@ -321,6 +331,7 @@ def do_stop_and_process():
         with state_lock:
             processing = False
         update_menubar_icon("idle")
+        _log("Reset to idle")
 
 
 def toggle_recording():
@@ -328,6 +339,8 @@ def toggle_recording():
     with state_lock:
         is_rec = recording
         is_proc = processing
+
+    _log(f"Toggle (recording={is_rec} processing={is_proc})")
 
     if is_rec:
         def _stop_with_deadline():
@@ -343,10 +356,12 @@ def toggle_recording():
                 with state_lock:
                     processing = False
                 update_menubar_icon("idle")
+                _log("Reset to idle (forced)")
         threading.Thread(target=_deadline, daemon=True).start()
     elif not is_proc:
         with state_lock:
             do_start()
+    # If processing, ignore the tap
 
 
 poll_fn_was_down = False
@@ -362,17 +377,22 @@ def poll_fn_key():
 
     try:
         poll_count += 1
+        # Log heartbeat every 60s (1200 ticks at 0.05s)
+        if poll_count % 1200 == 0:
+            _log(f"poll heartbeat #{poll_count}")
 
         flags = NSEvent.modifierFlags()
         fn_is_down = bool(flags & NSFunctionKeyMask)
 
         if fn_is_down and not poll_fn_was_down:
+            _log("poll: fn DOWN")
             poll_fn_down_time = time.time()
             poll_fn_had_other = False
         elif not fn_is_down and poll_fn_was_down:
             elapsed = time.time() - poll_fn_down_time
             since_last = time.time() - last_toggle_time
             other_mods = flags & 0xFFFF0000 & ~NSFunctionKeyMask
+            _log(f"poll: fn UP elapsed={elapsed:.3f} since_last={since_last:.3f}")
             if not poll_fn_had_other and not other_mods and elapsed < 0.5 and since_last > 0.5:
                 last_toggle_time = time.time()
                 toggle_recording()
@@ -408,7 +428,7 @@ if __name__ == "__main__":
     # Disable App Nap — prevents macOS from suspending timers/monitors
     import Foundation
     activity = Foundation.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
-        0x00FFFFFF,
+        0x00FFFFFF,  # NSActivityUserInitiatedAllowingIdleSystemSleep + all flags
         "Listening for fn key"
     )
 
@@ -426,9 +446,10 @@ if __name__ == "__main__":
     _fn_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
         0.05, _fn_poller, "poll:", None, True
     )
+    # Add timer to common run loop modes so it fires even during menu tracking
     NSRunLoop.currentRunLoop().addTimer_forMode_(_fn_timer, Foundation.NSRunLoopCommonModes)
 
-    # 2. NSEvent monitors as backup
+    # 2. NSEvent monitors as backup (may silently die but works when alive)
     evt_state = {"fn_down": False, "fn_time": 0, "fn_other": False}
 
     def handle_flags_changed(event):
