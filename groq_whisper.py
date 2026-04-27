@@ -386,9 +386,11 @@ def update_menubar_icon(state="idle"):
 
 
 def notify(message):
+    # Escape backslashes and quotes to prevent AppleScript injection
+    safe = str(message).replace("\\", "\\\\").replace('"', '\\"')
     subprocess.run([
         "osascript", "-e",
-        f'display notification "{message}" with title "Groq Whisper"'
+        f'display notification "{safe}" with title "Free Wispr"'
     ], capture_output=True)
 
 
