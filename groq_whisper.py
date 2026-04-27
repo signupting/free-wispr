@@ -109,6 +109,7 @@ def save_history():
         os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
         with open(HISTORY_PATH, "w") as f:
             json.dump(transcription_history, f)
+        os.chmod(HISTORY_PATH, 0o600)
     except Exception as e:
         _log(f"History save error: {e}")
 
@@ -467,9 +468,19 @@ def play_sound(name):
         sound.play()
 
 
+LOG_PATH = os.path.expanduser("~/.local/groq-whisper-app/groq-whisper.log")
+
+
 def _log(msg):
-    with open("/tmp/groq-whisper.log", "a") as f:
-        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        new_file = not os.path.exists(LOG_PATH)
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        if new_file:
+            os.chmod(LOG_PATH, 0o600)
+    except Exception:
+        pass
 
 
 def _audio_callback(indata, frames, time_info, status):
@@ -553,13 +564,18 @@ def do_stop_and_process():
             tmp_path = f.name
         del audio_int16  # free memory early
 
-        # Save backup before API call
+        # Save backup before API call (user-only permissions)
         backup_dir = os.path.expanduser("~/.local/groq-whisper-app/backups")
-        os.makedirs(backup_dir, exist_ok=True)
+        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(backup_dir, 0o700)
+        except Exception:
+            pass
         backup_path = os.path.join(backup_dir, f"{time.strftime('%Y%m%d_%H%M%S')}.wav")
         try:
             import shutil
             shutil.copy2(tmp_path, backup_path)
+            os.chmod(backup_path, 0o600)
             _log(f"Backup saved: {backup_path}")
         except Exception as e:
             _log(f"Backup failed: {e}")
