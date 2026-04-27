@@ -19,15 +19,20 @@ import objc
 from AppKit import NSSound
 from AppKit import (
     NSApplication, NSWindow, NSView, NSColor, NSFont,
-    NSMakeRect, NSScreen, NSBezierPath,
+    NSMakeRect, NSMakePoint, NSScreen, NSBezierPath,
     NSWindowStyleMaskBorderless, NSBackingStoreBuffered,
+    NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+    NSWindowStyleMaskResizable, NSWindowStyleMaskFullSizeContentView,
     NSFloatingWindowLevel,
     NSApplicationActivationPolicyAccessory,
     NSStatusBar, NSVariableStatusItemLength, NSMenu, NSMenuItem,
     NSEvent, NSFlagsChangedMask, NSFunctionKeyMask,
     NSKeyDownMask, NSKeyUpMask,
     NSImage, NSSize, NSTimer, NSRunLoop,
+    NSScrollView, NSTextView, NSButton, NSTextField, NSStackView,
+    NSVisualEffectView,
 )
+import json
 
 SAMPLE_RATE = 16000
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -47,76 +52,337 @@ FN_KEYCODE = 63
 
 
 def create_mic_image(state="idle"):
-    size = NSSize(18, 18)
-    image = NSImage.alloc().initWithSize_(size)
-    image.lockFocus()
+    from AppKit import NSImageSymbolConfiguration
 
     if state == "recording":
-        NSColor.colorWithRed_green_blue_alpha_(0.9, 0.15, 0.15, 1.0).set()
-        NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(0, 0, 18, 18)).fill()
-        NSColor.whiteColor().set()
+        symbol = "mic.fill"
+        color = NSColor.colorWithRed_green_blue_alpha_(0.9, 0.15, 0.15, 1.0)
     elif state == "processing":
-        NSColor.colorWithRed_green_blue_alpha_(1.0, 0.6, 0.0, 1.0).set()
-        NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(0, 0, 18, 18)).fill()
-        NSColor.whiteColor().set()
+        symbol = "mic.fill"
+        color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.6, 0.0, 1.0)
     else:
-        NSColor.colorWithRed_green_blue_alpha_(0.4, 0.4, 0.4, 1.0).set()
+        symbol = "mic"
+        color = None
 
-    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-        NSMakeRect(7, 6, 4, 8), 2, 2
-    ).fill()
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, "Free Wispr")
+    if img is None:
+        return None
 
-    arc = NSBezierPath.bezierPath()
-    arc.setLineWidth_(1.2)
-    arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
-        (9, 9), 5, 0, 180, True
-    )
-    arc.stroke()
+    if color is not None:
+        config = NSImageSymbolConfiguration.configurationWithPaletteColors_([color])
+        img = img.imageWithSymbolConfiguration_(config)
+    else:
+        img.setTemplate_(True)
 
-    line = NSBezierPath.bezierPath()
-    line.setLineWidth_(1.2)
-    line.moveToPoint_((9, 4))
-    line.lineToPoint_((9, 2))
-    line.moveToPoint_((6, 2))
-    line.lineToPoint_((12, 2))
-    line.stroke()
-
-    image.unlockFocus()
-    image.setTemplate_(state == "idle")
-    return image
+    return img
 
 
 class ToggleHelper(objc.lookUpClass("NSObject")):
     def toggleRecording_(self, sender):
         toggle_recording()
 
+    def updateIcon_(self, state):
+        img = create_mic_image(state)
+        status_item.button().setImage_(img)
+
 toggle_helper = None
+
+# Clipboard history — last 10 transcriptions, persisted to disk
+transcription_history = []
+MAX_HISTORY = 10
+HISTORY_PATH = os.path.expanduser("~/.local/groq-whisper-app/history.json")
+
+
+def load_history():
+    global transcription_history
+    try:
+        if os.path.exists(HISTORY_PATH):
+            with open(HISTORY_PATH, "r") as f:
+                transcription_history = [tuple(x) for x in json.load(f)]
+    except Exception as e:
+        _log(f"History load error: {e}")
+        transcription_history = []
+
+
+def save_history():
+    try:
+        os.makedirs(os.path.dirname(HISTORY_PATH), exist_ok=True)
+        with open(HISTORY_PATH, "w") as f:
+            json.dump(transcription_history, f)
+    except Exception as e:
+        _log(f"History save error: {e}")
+
+
+class CopyHelper(objc.lookUpClass("NSObject")):
+    def initWithText_(self, text):
+        self = objc.super(CopyHelper, self).init()
+        if self is not None:
+            self._text = text
+        return self
+
+    def copyText_(self, sender):
+        subprocess.run(["pbcopy"], input=self._text.encode(), check=True)
+        # Visual feedback — change button title briefly
+        try:
+            sender.setTitle_("Copied!")
+            def reset():
+                sender.setTitle_("Copy")
+            from Foundation import NSOperationQueue
+            import threading as _t
+            _t.Timer(1.0, lambda: NSOperationQueue.mainQueue().addOperationWithBlock_(reset)).start()
+        except Exception:
+            pass
+
+copy_helpers = []  # keep strong references to prevent GC
+
+
+def rebuild_menu():
+    """Rebuild the status item menu with current history. Call on main thread."""
+    menu = NSMenu.alloc().init()
+
+    toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Toggle Recording", "toggleRecording:", "r"
+    )
+    toggle_item.setTarget_(toggle_helper)
+    menu.addItem_(toggle_item)
+
+    if transcription_history:
+        menu.addItem_(NSMenuItem.separatorItem())
+        header = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent Dictations", "", ""
+        )
+        header.setEnabled_(False)
+        menu.addItem_(header)
+
+        copy_helpers.clear()
+        for ts, text in transcription_history:
+            label = text if len(text) <= 60 else text[:57] + "…"
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{ts}  {label}", "copyText:", ""
+            )
+            helper = CopyHelper.alloc().initWithText_(text)
+            copy_helpers.append(helper)
+            item.setTarget_(helper)
+            menu.addItem_(item)
+
+    menu.addItem_(NSMenuItem.separatorItem())
+    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Quit Free Wispr", "terminate:", "q"
+    )
+    menu.addItem_(quit_item)
+    status_item.setMenu_(menu)
+
+
+def add_to_history(text):
+    ts = time.strftime("%Y-%m-%d %H:%M")
+    transcription_history.insert(0, (ts, text))
+    if len(transcription_history) > MAX_HISTORY:
+        transcription_history.pop()
+    save_history()
+    from Foundation import NSOperationQueue
+    NSOperationQueue.mainQueue().addOperationWithBlock_(rebuild_menu)
+
+
+history_window = None
+
+
+def show_history_picker():
+    """Show a window with cards for each recent dictation, each with a Copy button."""
+    from Foundation import NSOperationQueue
+
+    def _show():
+        global history_window
+
+        if not transcription_history:
+            subprocess.run([
+                "osascript", "-e",
+                'display notification "No recent dictations yet" with title "Free Wispr"'
+            ], capture_output=True)
+            return
+
+        WIDTH = 580
+        CARD_GAP = 10
+        OUTER_PAD = 18
+        TITLE_BAR = 38
+        TS_TOP_PAD = 14   # space above timestamp
+        TS_HEIGHT = 14
+        TS_TEXT_GAP = 8   # gap between ts and text
+        TEXT_BOTTOM_PAD = 16
+        BTN_WIDTH = 76
+        BTN_GAP = 14      # gap between text and copy button
+        TEXT_WIDTH = WIDTH - 2 * OUTER_PAD - 2 * 18 - BTN_WIDTH - BTN_GAP  # 18 = inner card pad
+
+        # Pre-measure card heights using a sizing NSTextField
+        sizer = NSTextField.alloc().init()
+        sizer.setEditable_(False)
+        sizer.setBordered_(False)
+        sizer.setBezeled_(False)
+        sizer.setDrawsBackground_(False)
+        sizer.setFont_(NSFont.systemFontOfSize_(13))
+        sizer.cell().setWraps_(True)
+        sizer.cell().setTruncatesLastVisibleLine_(True)
+
+        cards = []
+        line_height = 17
+        max_lines = 6
+        for ts, text in transcription_history:
+            sizer.setStringValue_(text)
+            ideal = sizer.cell().cellSizeForBounds_(
+                NSMakeRect(0, 0, TEXT_WIDTH, max_lines * line_height + 4)
+            )
+            text_h = min(max_lines * line_height, max(line_height, int(ideal.height) + 2))
+            card_h = TS_TOP_PAD + TS_HEIGHT + TS_TEXT_GAP + text_h + TEXT_BOTTOM_PAD
+            cards.append((ts, text, card_h, text_h))
+
+        n = len(cards)
+        content_h = sum(c[2] for c in cards) + (n - 1) * CARD_GAP + OUTER_PAD * 2
+        win_h = min(720, content_h + TITLE_BAR)
+
+        if history_window is None:
+            screen = NSScreen.mainScreen().frame()
+            x = (screen.size.width - WIDTH) / 2
+            y = (screen.size.height - win_h) / 2
+            style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                     | NSWindowStyleMaskResizable
+                     | NSWindowStyleMaskFullSizeContentView)
+            history_window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(x, y, WIDTH, win_h),
+                style, NSBackingStoreBuffered, False
+            )
+            history_window.setTitle_("Free Wispr")
+            history_window.setReleasedWhenClosed_(False)
+            history_window.setTitlebarAppearsTransparent_(True)
+            history_window.setMovableByWindowBackground_(True)
+            history_window.setBackgroundColor_(NSColor.clearColor())
+
+        # Frosted-glass background
+        bg = NSVisualEffectView.alloc().initWithFrame_(
+            NSMakeRect(0, 0, WIDTH, win_h)
+        )
+        bg.setMaterial_(7)  # NSVisualEffectMaterialHUDWindow — strong frosted feel
+        bg.setBlendingMode_(0)  # BehindWindow
+        bg.setState_(1)  # Active
+
+        scroll_frame = NSMakeRect(0, 0, WIDTH, win_h - TITLE_BAR)
+        scroll = NSScrollView.alloc().initWithFrame_(scroll_frame)
+        scroll.setHasVerticalScroller_(True)
+        scroll.setAutohidesScrollers_(True)
+        scroll.setBorderType_(0)
+        scroll.setDrawsBackground_(False)
+
+        doc = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, WIDTH, content_h))
+
+        copy_helpers.clear()
+
+        # Lay out cards top-down (most recent at top)
+        running_y = content_h - OUTER_PAD
+        for i, (ts, text, card_h, text_h) in enumerate(cards):
+            running_y -= card_h
+            y_pos = running_y
+
+            card = NSView.alloc().initWithFrame_(
+                NSMakeRect(OUTER_PAD, y_pos, WIDTH - 2 * OUTER_PAD, card_h)
+            )
+            card.setWantsLayer_(True)
+            # Subtle frosted-white card
+            card.layer().setBackgroundColor_(
+                NSColor.colorWithRed_green_blue_alpha_(1.0, 1.0, 1.0, 0.7).CGColor()
+            )
+            card.layer().setCornerRadius_(14.0)
+            card.layer().setBorderWidth_(0.5)
+            card.layer().setBorderColor_(
+                NSColor.colorWithRed_green_blue_alpha_(0, 0, 0, 0.06).CGColor()
+            )
+            card.layer().setShadowOpacity_(0.06)
+            card.layer().setShadowRadius_(8.0)
+            card.layer().setShadowOffset_(NSSize(0, -2))
+
+            # Timestamp
+            ts_label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(18, card_h - TS_TOP_PAD - TS_HEIGHT, 240, TS_HEIGHT)
+            )
+            ts_label.setStringValue_(ts)
+            ts_label.setEditable_(False)
+            ts_label.setBordered_(False)
+            ts_label.setBezeled_(False)
+            ts_label.setDrawsBackground_(False)
+            ts_label.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(10.5, 0))
+            ts_label.setTextColor_(NSColor.tertiaryLabelColor())
+
+            # Text body
+            text_y = TEXT_BOTTOM_PAD
+            text_label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(18, text_y, TEXT_WIDTH, text_h)
+            )
+            text_label.setStringValue_(text)
+            text_label.setEditable_(False)
+            text_label.setSelectable_(True)
+            text_label.setBordered_(False)
+            text_label.setBezeled_(False)
+            text_label.setDrawsBackground_(False)
+            text_label.setFont_(NSFont.systemFontOfSize_(13))
+            text_label.setTextColor_(NSColor.labelColor())
+            text_label.setLineBreakMode_(4)
+            text_label.cell().setWraps_(True)
+            text_label.cell().setTruncatesLastVisibleLine_(True)
+
+            # Copy button — modern, accent-coloured
+            btn_y = (card_h - 26) / 2
+            btn = NSButton.alloc().initWithFrame_(
+                NSMakeRect(WIDTH - 2 * OUTER_PAD - 18 - BTN_WIDTH, btn_y, BTN_WIDTH, 26)
+            )
+            btn.setTitle_("Copy")
+            btn.setBezelStyle_(15)  # NSBezelStyleInline — modern pill
+            try:
+                btn.setHasDestructiveAction_(False)
+            except Exception:
+                pass
+            btn.setControlSize_(0)
+            btn.setFont_(NSFont.systemFontOfSize_weight_(12, 0.3))
+            helper = CopyHelper.alloc().initWithText_(text)
+            copy_helpers.append(helper)
+            btn.setTarget_(helper)
+            btn.setAction_("copyText:")
+
+            card.addSubview_(ts_label)
+            card.addSubview_(text_label)
+            card.addSubview_(btn)
+            doc.addSubview_(card)
+
+            running_y -= CARD_GAP
+
+        scroll.setDocumentView_(doc)
+
+        # Scroll to top so most recent is visible
+        clip_h = scroll.contentView().frame().size.height
+        scroll.contentView().scrollToPoint_(NSMakePoint(0, max(0, content_h - clip_h)))
+        scroll.reflectScrolledClipView_(scroll.contentView())
+
+        bg.addSubview_(scroll)
+        history_window.setContentView_(bg)
+        history_window.makeKeyAndOrderFront_(None)
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+    NSOperationQueue.mainQueue().addOperationWithBlock_(_show)
+
 
 def create_menubar():
     global status_item, toggle_helper
     toggle_helper = ToggleHelper.alloc().init()
     status_bar = NSStatusBar.systemStatusBar()
     status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
+    status_item.setAutosaveName_("FreeWispr")
+    status_item.setVisible_(True)
     status_item.button().setImage_(create_mic_image("idle"))
-
-    menu = NSMenu.alloc().init()
-    toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Toggle Recording", "toggleRecording:", "r"
-    )
-    toggle_item.setTarget_(toggle_helper)
-    menu.addItem_(toggle_item)
-    menu.addItem_(NSMenuItem.separatorItem())
-    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Quit Groq Whisper", "terminate:", "q"
-    )
-    menu.addItem_(quit_item)
-    status_item.setMenu_(menu)
+    rebuild_menu()
 
 
 def update_menubar_icon(state="idle"):
-    status_item.button().performSelectorOnMainThread_withObject_waitUntilDone_(
-        "setImage:", create_mic_image(state), False
-    )
+    from Foundation import NSOperationQueue
+    def _update():
+        img = create_mic_image(state)
+        status_item.button().setImage_(img)
+    NSOperationQueue.mainQueue().addOperationWithBlock_(_update)
 
 
 def notify(message):
@@ -209,32 +475,22 @@ def _audio_callback(indata, frames, time_info, status):
         audio_frames.append(indata.copy())
 
 
-# Persistent audio stream — opened once at startup, never closed.
-# This avoids CoreAudio Pa_OpenStream deadlocks with the main run loop.
-persistent_stream = None
-
-
-def init_audio_stream():
-    """Open the persistent audio stream. Call once at startup from a background thread."""
-    global persistent_stream
-    try:
-        persistent_stream = sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1,
-            dtype="float32", callback=_audio_callback
-        )
-        persistent_stream.start()
-        _log("Persistent audio stream opened")
-    except Exception as e:
-        _log(f"Audio stream init error: {e}")
+active_stream = None
 
 
 def do_start():
-    """Start recording. Must be called with state_lock held."""
-    global recording, audio_frames
+    """Open mic stream and start recording. Always called from a background thread."""
+    global recording, audio_frames, active_stream
     if recording or processing:
         return
-    if not persistent_stream or not persistent_stream.active:
-        _log("ERROR: No active audio stream")
+    try:
+        active_stream = sd.InputStream(
+            samplerate=SAMPLE_RATE, channels=1,
+            dtype="float32", callback=_audio_callback
+        )
+        active_stream.start()
+    except Exception as e:
+        _log(f"Stream open error: {e}")
         return
     recording = True
     audio_frames = []
@@ -255,6 +511,16 @@ def do_stop_and_process():
         processing = True
         frames = list(audio_frames)
         audio_frames.clear()
+
+    # Close mic stream — releases the mic so macOS indicator disappears
+    global active_stream
+    try:
+        if active_stream:
+            active_stream.stop()
+            active_stream.close()
+            active_stream = None
+    except Exception as e:
+        _log(f"Stream close error: {e}")
 
     _log("Stopping...")
 
@@ -311,6 +577,7 @@ def do_stop_and_process():
                 text = clean_prompt(text)
                 _log(f"Cleaned: '{text}'")
                 paste_text(text)
+                add_to_history(text)
                 play_sound("Ping")
                 # Remove backup on success
                 try:
@@ -359,8 +626,7 @@ def toggle_recording():
                 _log("Reset to idle (forced)")
         threading.Thread(target=_deadline, daemon=True).start()
     elif not is_proc:
-        with state_lock:
-            do_start()
+        threading.Thread(target=do_start, daemon=True).start()
     # If processing, ignore the tap
 
 
@@ -369,6 +635,32 @@ poll_fn_down_time = 0
 poll_fn_had_other = False
 last_toggle_time = 0
 poll_count = 0
+
+# Double-tap fn detection
+DOUBLE_TAP_WINDOW = 0.35
+last_fn_up_time = 0
+pending_single_tap_timer = None
+
+
+def handle_fn_tap():
+    """Called when fn is tapped. Distinguishes single vs double tap."""
+    global last_fn_up_time, pending_single_tap_timer
+
+    now = time.time()
+    since_last_up = now - last_fn_up_time
+    last_fn_up_time = now
+
+    if pending_single_tap_timer is not None and pending_single_tap_timer.is_alive():
+        # Second tap within window — cancel pending toggle, show history instead
+        pending_single_tap_timer.cancel()
+        pending_single_tap_timer = None
+        threading.Thread(target=show_history_picker, daemon=True).start()
+        return
+
+    # First tap — schedule toggle after window expires
+    pending_single_tap_timer = threading.Timer(DOUBLE_TAP_WINDOW, toggle_recording)
+    pending_single_tap_timer.daemon = True
+    pending_single_tap_timer.start()
 
 
 def poll_fn_key():
@@ -393,9 +685,9 @@ def poll_fn_key():
             since_last = time.time() - last_toggle_time
             other_mods = flags & 0xFFFF0000 & ~NSFunctionKeyMask
             _log(f"poll: fn UP elapsed={elapsed:.3f} since_last={since_last:.3f}")
-            if not poll_fn_had_other and not other_mods and elapsed < 0.5 and since_last > 0.5:
+            if not poll_fn_had_other and not other_mods and elapsed < 0.5 and since_last > 0.1:
                 last_toggle_time = time.time()
-                toggle_recording()
+                handle_fn_tap()
         elif fn_is_down:
             other_mods = flags & 0xFFFF0000 & ~NSFunctionKeyMask
             if other_mods:
@@ -413,14 +705,12 @@ if __name__ == "__main__":
 
     groq_client = Groq(api_key=GROQ_API_KEY, timeout=30.0)
 
+    load_history()
+
     if HF_API_KEY:
         _log("HF fallback ready")
     else:
         _log("WARNING: No HF_API_KEY, no fallback")
-
-    # Open persistent audio stream BEFORE the run loop starts
-    # (must happen before NSApplication.run() to avoid CoreAudio deadlock)
-    init_audio_stream()
 
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
@@ -465,9 +755,9 @@ if __name__ == "__main__":
                 elif not fn_is_down and evt_state["fn_down"]:
                     elapsed = time.time() - evt_state["fn_time"]
                     since_last = time.time() - last_toggle_time
-                    if not evt_state["fn_other"] and elapsed < 0.5 and since_last > 0.5:
+                    if not evt_state["fn_other"] and elapsed < 0.5 and since_last > 0.1:
                         last_toggle_time = time.time()
-                        toggle_recording()
+                        handle_fn_tap()
                 evt_state["fn_down"] = fn_is_down
             else:
                 evt_state["fn_other"] = True
