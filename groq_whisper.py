@@ -525,7 +525,26 @@ def do_stop_and_process():
         frames = list(audio_frames)
         audio_frames.clear()
 
-    # Close mic stream — releases the mic so macOS indicator disappears
+    _log("Stopping...")
+
+    # Save backup IMMEDIATELY — before stream close or any other op that could hang
+    # so we never lose audio to a hung close.
+    backup_path = None
+    if frames:
+        try:
+            audio_early = np.concatenate(frames, axis=0)
+            audio_early_int16 = (audio_early * 32767).astype(np.int16)
+            backup_dir = os.path.expanduser("~/.local/groq-whisper-app/backups")
+            os.makedirs(backup_dir, mode=0o700, exist_ok=True)
+            backup_path = os.path.join(backup_dir, f"{time.strftime('%Y%m%d_%H%M%S')}.wav")
+            wav_write(backup_path, SAMPLE_RATE, audio_early_int16)
+            os.chmod(backup_path, 0o600)
+            _log(f"Backup saved early: {backup_path}")
+            del audio_early, audio_early_int16
+        except Exception as e:
+            _log(f"Early backup failed: {e}")
+
+    # Now close mic stream (this can hang on CoreAudio in rare cases)
     global active_stream
     try:
         if active_stream:
@@ -534,8 +553,6 @@ def do_stop_and_process():
             active_stream = None
     except Exception as e:
         _log(f"Stream close error: {e}")
-
-    _log("Stopping...")
 
     play_sound("Pop")
 
@@ -564,21 +581,7 @@ def do_stop_and_process():
             tmp_path = f.name
         del audio_int16  # free memory early
 
-        # Save backup before API call (user-only permissions)
-        backup_dir = os.path.expanduser("~/.local/groq-whisper-app/backups")
-        os.makedirs(backup_dir, mode=0o700, exist_ok=True)
-        try:
-            os.chmod(backup_dir, 0o700)
-        except Exception:
-            pass
-        backup_path = os.path.join(backup_dir, f"{time.strftime('%Y%m%d_%H%M%S')}.wav")
-        try:
-            import shutil
-            shutil.copy2(tmp_path, backup_path)
-            os.chmod(backup_path, 0o600)
-            _log(f"Backup saved: {backup_path}")
-        except Exception as e:
-            _log(f"Backup failed: {e}")
+        # Backup already saved above (before stream close) — no duplicate
 
         try:
             _log("Sending to Groq...")
