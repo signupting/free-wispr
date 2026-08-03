@@ -1,0 +1,17 @@
+# Secrets — API keys, never commit
+.env
+
+# Personal data — recorded dictations & transcription history
+backups/
+history.json
+last_provider.txt
+
+# Logs
+*.log
+
+# Model weights (large; rebuild with tools/build_quantized.py)
+parakeet-8bit/
+
+# Python
+__pycache__/
+*.pyc
