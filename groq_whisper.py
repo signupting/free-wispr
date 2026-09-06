@@ -112,14 +112,19 @@ OTHER_MODS_MASK = 0x20000 | 0x40000 | 0x100000 | 0x800000
 def create_mic_image(state="idle"):
     from AppKit import NSImageSymbolConfiguration
 
+    # Deliberately NOT a mic glyph. macOS's own mic-in-use privacy indicator
+    # sits in the same menu bar using "mic"/"mic.fill", so a mic here reads as
+    # a duplicate icon and you can't tell at a glance which one is Free Wispr
+    # or whether it's actually running. "waveform" is unmistakably ours; the
+    # shape stays constant across states so only colour changes.
     if state == "recording":
-        symbol = "mic.fill"
+        symbol = "waveform"
         color = NSColor.colorWithRed_green_blue_alpha_(0.9, 0.15, 0.15, 1.0)
     elif state == "processing":
-        symbol = "mic.fill"
+        symbol = "waveform"
         color = NSColor.colorWithRed_green_blue_alpha_(1.0, 0.6, 0.0, 1.0)
     else:
-        symbol = "mic"
+        symbol = "waveform"
         color = None
 
     img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, "Free Wispr")
@@ -436,11 +441,197 @@ def create_menubar():
     rebuild_menu()
 
 
+# ---------------------------------------------------------------- overlay --
+# A floating pill above every app showing recording/transcribing state. The
+# menu-bar icon already changes colour, but it's one small glyph among a dozen
+# others — you can't tell at a glance whether you're actually recording, and a
+# dictation you thought was running but wasn't costs a whole re-speak.
+#
+# Deliberately passive: borderless (so it can never become key), click-through,
+# and shown with orderFrontRegardless() so it never steals focus from whatever
+# you're dictating into.
+# Pill width is computed per state from the text — a fixed width left
+# "Transcribing…" and "Recording 0:04" sitting off-centre with dead space on
+# the right. Layout is [PAD][dot][GAP][text][PAD], centred on screen.
+OVERLAY_H = 54.0
+OVERLAY_PAD = 20.0
+OVERLAY_GAP = 10.0
+OVERLAY_DOT = 13.0
+OVERLAY_BOTTOM_MARGIN = 120.0   # clear of the Dock
+
+overlay_window = None
+overlay_dot = None
+overlay_label = None
+overlay_timer = None
+_overlay_started_at = 0.0
+_overlay_blink = True
+
+# Collection-behaviour bits. Imported by name where available, with literal
+# fallbacks — same pragmatism as the raw setMaterial_(7) above.
+try:
+    from AppKit import (NSWindowCollectionBehaviorCanJoinAllSpaces,
+                        NSWindowCollectionBehaviorStationary,
+                        NSWindowCollectionBehaviorFullScreenAuxiliary)
+except ImportError:  # pragma: no cover
+    NSWindowCollectionBehaviorCanJoinAllSpaces = 1 << 0
+    NSWindowCollectionBehaviorStationary = 1 << 4
+    NSWindowCollectionBehaviorFullScreenAuxiliary = 1 << 8
+NS_STATUS_WINDOW_LEVEL = 25  # above NSFloatingWindowLevel(3), below screensaver
+
+
+def _build_overlay():
+    """Create the overlay window once. Main thread only."""
+    global overlay_window, overlay_dot, overlay_label
+
+    win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, OVERLAY_BOTTOM_MARGIN, 200, OVERLAY_H),  # sized in _layout_overlay
+        NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False
+    )
+    win.setLevel_(NS_STATUS_WINDOW_LEVEL)
+    win.setOpaque_(False)
+    win.setBackgroundColor_(NSColor.clearColor())
+    win.setHasShadow_(True)
+    win.setIgnoresMouseEvents_(True)      # clicks pass straight through
+    win.setReleasedWhenClosed_(False)
+    win.setCollectionBehavior_(
+        NSWindowCollectionBehaviorCanJoinAllSpaces
+        | NSWindowCollectionBehaviorStationary
+        | NSWindowCollectionBehaviorFullScreenAuxiliary
+    )
+
+    bg = NSVisualEffectView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, 200, OVERLAY_H))
+    bg.setMaterial_(7)      # HUDWindow — matches the history panel
+    bg.setBlendingMode_(0)  # BehindWindow
+    bg.setState_(1)
+    bg.setWantsLayer_(True)
+    bg.layer().setCornerRadius_(OVERLAY_H / 2.0)   # pill
+    bg.layer().setMasksToBounds_(True)
+
+    # NSImageView + tinted SF Symbol rather than a CALayer background colour:
+    # layer().setBackgroundColor_ needs a CGColor, and PyObjC wraps that as an
+    # untyped pointer (ObjCPointerWarning) it doesn't memory-manage. Same
+    # palette-configuration trick create_mic_image() already uses.
+    from AppKit import NSImageView
+    dot = NSImageView.alloc().initWithFrame_(
+        NSMakeRect(OVERLAY_PAD, (OVERLAY_H - OVERLAY_DOT) / 2, OVERLAY_DOT, OVERLAY_DOT))
+    bg.addSubview_(dot)
+
+    label = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(OVERLAY_PAD + OVERLAY_DOT + OVERLAY_GAP, (OVERLAY_H - 22) / 2, 120, 22))
+    label.setBezeled_(False)
+    label.setDrawsBackground_(False)
+    label.setEditable_(False)
+    label.setSelectable_(False)
+    label.setFont_(NSFont.systemFontOfSize_(14))
+    label.setTextColor_(NSColor.whiteColor())
+    bg.addSubview_(label)
+
+    win.setContentView_(bg)
+    overlay_window, overlay_dot, overlay_label = win, dot, label
+
+
+def _layout_overlay(text):
+    """Set the label, then size the pill to fit it and re-centre on screen.
+
+    Called on every text change (including each 0.5s tick) so the pill stays
+    symmetric as the elapsed clock widens from 0:09 to 0:10 to 10:00.
+    """
+    overlay_label.setStringValue_(text)
+    overlay_label.sizeToFit()
+    text_w = overlay_label.frame().size.width
+    win_w = OVERLAY_PAD + OVERLAY_DOT + OVERLAY_GAP + text_w + OVERLAY_PAD
+
+    screen = NSScreen.mainScreen().frame()
+    x = (screen.size.width - win_w) / 2
+    overlay_window.setFrame_display_(
+        NSMakeRect(x, OVERLAY_BOTTOM_MARGIN, win_w, OVERLAY_H), True)
+    overlay_window.contentView().setFrame_(NSMakeRect(0, 0, win_w, OVERLAY_H))
+    # vertical centring: sizeToFit collapses the field to the glyph height
+    lf = overlay_label.frame()
+    overlay_label.setFrameOrigin_(NSMakePoint(
+        OVERLAY_PAD + OVERLAY_DOT + OVERLAY_GAP, (OVERLAY_H - lf.size.height) / 2))
+
+
+def _dot_image(r, g, b):
+    """Filled circle tinted to the same colours as the menu-bar icon states."""
+    from AppKit import NSImageSymbolConfiguration
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+        "circle.fill", "status")
+    if img is None:
+        return None
+    color = NSColor.colorWithRed_green_blue_alpha_(r, g, b, 1.0)
+    return img.imageWithSymbolConfiguration_(
+        NSImageSymbolConfiguration.configurationWithPaletteColors_([color]))
+
+
+class OverlayHelper(objc.lookUpClass("NSObject")):
+    def tick_(self, timer):
+        # Blink the dot and tick the elapsed clock while recording.
+        global _overlay_blink
+        if overlay_window is None:
+            return
+        _overlay_blink = not _overlay_blink
+        elapsed = int(time.time() - _overlay_started_at)
+        _layout_overlay(f"Recording   {elapsed // 60}:{elapsed % 60:02d}")
+        overlay_dot.setAlphaValue_(1.0 if _overlay_blink else 0.3)
+
+
+overlay_helper = None
+
+
+def _overlay_stop_timer():
+    global overlay_timer
+    if overlay_timer is not None:
+        overlay_timer.invalidate()
+        overlay_timer = None
+
+
+def update_overlay(state):
+    """Show/hide the floating pill. Main thread only — called from _update()."""
+    global overlay_timer, overlay_helper, _overlay_started_at, _overlay_blink
+
+    if state == "idle":
+        _overlay_stop_timer()
+        if overlay_window is not None:
+            overlay_window.orderOut_(None)
+        return
+
+    if overlay_window is None:
+        _build_overlay()
+    if overlay_helper is None:
+        overlay_helper = OverlayHelper.alloc().init()
+
+    if state == "recording":
+        _overlay_started_at = time.time()
+        _overlay_blink = True
+        overlay_dot.setImage_(_dot_image(0.9, 0.15, 0.15))
+        overlay_dot.setAlphaValue_(1.0)
+        _layout_overlay("Recording   0:00")
+        _overlay_stop_timer()
+        overlay_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.5, overlay_helper, "tick:", None, True)
+        NSRunLoop.currentRunLoop().addTimer_forMode_(overlay_timer, "NSRunLoopCommonModes")
+    else:  # processing
+        _overlay_stop_timer()
+        overlay_dot.setImage_(_dot_image(1.0, 0.6, 0.0))
+        overlay_dot.setAlphaValue_(1.0)
+        _layout_overlay("Transcribing…")
+
+    overlay_window.orderFrontRegardless()   # show without taking focus
+
+
 def update_menubar_icon(state="idle"):
     from Foundation import NSOperationQueue
     def _update():
         img = create_mic_image(state)
         status_item.button().setImage_(img)
+        # Overlay rides the same state funnel as the icon, so every existing
+        # transition drives it without touching the call sites.
+        try:
+            update_overlay(state)
+        except Exception as e:
+            _log(f"Overlay error: {e}")   # never let chrome break dictation
     NSOperationQueue.mainQueue().addOperationWithBlock_(_update)
 
 
@@ -617,12 +808,25 @@ def _transcribe_local_impl(tmp_path):
     # throttled/timed-out, and 2-3x faster than the whisper-turbo it replaced.
     # The model is loaded once and cached (see _get_parakeet). Runs on the MLX
     # worker thread only — never call this directly, go through transcribe_local.
+    import mlx.core as mx
     model = _get_parakeet()
     # chunk_duration splits long audio (>60s) into overlapping windows that
     # Parakeet's own token-merge stitches back together — without it, a multi-
     # minute clip runs a single un-chunked pass that effectively hangs.
-    result = model.transcribe(tmp_path, chunk_duration=60.0, overlap_duration=10.0)
-    return _strip_fillers(result.text.strip())
+    try:
+        result = model.transcribe(tmp_path, chunk_duration=60.0, overlap_duration=10.0)
+        return _strip_fillers(result.text.strip())
+    finally:
+        # THE leak fix. MLX caches GPU buffers per tensor SHAPE, and every new
+        # dictation length allocates a fresh set that is never released — so the
+        # cache climbs with each distinct clip length until it plateaus around
+        # 4.4GB (footprint ~5.3GB), which is what tripped FOOTPRINT_RESTART_MB
+        # and made the app appear to "quit itself" after a dictation. Measured
+        # 2026-08-31: varied lengths 3s..78s reached 5326MB uncleared vs
+        # 873-1582MB cleared, and it crosses the 2800MB threshold at a single
+        # 34s clip. Cost is nil — +0.02s on a 3s clip, 0.00s at 8s and above.
+        # In `finally` so a transcribe error can't strand a full cache.
+        mx.clear_cache()
 
 
 def transcribe_local(tmp_path):
@@ -723,6 +927,37 @@ def _log(msg):
             os.chmod(LOG_PATH, 0o600)
     except Exception:
         pass
+
+
+_start_time = time.time()
+# Backstop only — the leak this was written for is FIXED (see the mx.clear_cache()
+# call in _transcribe_local_impl). It was MLX's GPU buffer cache: MLX caches
+# buffers per tensor shape, so every new dictation *length* allocated a fresh set
+# that was never freed, climbing to ~5.3GB. An earlier comment here claimed MLX
+# inference was ruled out — that was wrong, it had been measured with MLX's own
+# active/cache counters, which don't see IOAccelerator allocations. Use
+# `footprint <pid>` and read the "IOAccelerator (graphics)" line instead.
+#
+# With the fix, peak is ~1.3GB against a ~1.4GB fresh baseline, so this should
+# now never fire. It stays as a safety net: if it ever does trip, something new
+# is leaking and is worth investigating rather than working around.
+# launchd (KeepAlive/SuccessfulExit=false) relaunches on a non-zero exit.
+FOOTPRINT_RESTART_MB = 2800
+MAX_UPTIME_SECONDS = 48 * 3600
+
+
+def _phys_footprint_mb():
+    # Real memory charge incl. compressed/swapped pages — RSS is useless here
+    # (the leaked process showed 30MB RSS but 5.3GB phys_footprint). Shells out
+    # to the system `footprint` tool; called at most every ~12min off the main
+    # thread so its VM-region walk never stalls the UI.
+    try:
+        out = subprocess.run(["footprint", str(os.getpid())],
+                             capture_output=True, text=True, timeout=15).stdout
+        m = re.search(r"phys_footprint:\s*([\d.]+)\s*MB", out)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
 
 
 def _audio_callback(indata, frames, time_info, status):
@@ -1052,12 +1287,28 @@ if __name__ == "__main__":
     KEEP_WARM_SECONDS = 120
 
     def _keep_warm_loop():
+        iters = 0
         while True:
             time.sleep(KEEP_WARM_SECONDS)
+            iters += 1
             try:
                 if recording or processing:
                     continue
                 _mlx_executor.submit(_warm).result()
+
+                # Every ~12min (6 x 120s), check the leak watchdog. Skipped while
+                # busy above so we never restart mid-dictation.
+                if iters % 6 == 0:
+                    footprint = _phys_footprint_mb()
+                    uptime_h = (time.time() - _start_time) / 3600
+                    _log(f"Health: footprint={footprint}MB uptime={uptime_h:.1f}h")
+                    over_mem = footprint is not None and footprint > FOOTPRINT_RESTART_MB
+                    over_age = (time.time() - _start_time) > MAX_UPTIME_SECONDS
+                    if over_mem or over_age:
+                        reason = (f"footprint {footprint}MB > {FOOTPRINT_RESTART_MB}"
+                                  if over_mem else f"uptime {uptime_h:.1f}h")
+                        _log(f"Watchdog restart ({reason}); launchd will relaunch")
+                        os._exit(1)  # non-zero -> KeepAlive relaunches fresh
             except Exception as e:
                 _log(f"Keep-warm failed: {e}")
     threading.Thread(target=_keep_warm_loop, daemon=True).start()
